@@ -9,18 +9,17 @@ import os
 import psycopg2
 import asyncio
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 from enum import Enum
-from flask import Flask, request
-
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, User
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes
 )
 from apscheduler.jobstores.base import JobLookupError
+from threading import Lock
 
 # Configure logging
 logging.basicConfig(
@@ -34,8 +33,6 @@ DEFAULT_COINS = 100
 DEFAULT_GAME_COST = 10
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')
-
-app = Flask(__name__)
 
 # Game States
 class GameState(Enum):
@@ -249,18 +246,20 @@ class DatabaseManager:
                     return False
                 
                 conn.autocommit = False
-                cursor.execute("UPDATE users SET coins = coins - %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s", (amount, from_user_id))
-                cursor.execute("UPDATE users SET coins = coins + %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s", (amount, to_user_id))
-                cursor.execute("""
-                    INSERT INTO transactions (from_user_id, to_user_id, amount, transaction_type)
-                    VALUES (%s, %s, %s, 'transfer')
-                """, (from_user_id, to_user_id, amount))
-                conn.commit()
-                return True
+                try:
+                    cursor.execute("UPDATE users SET coins = coins - %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s", (amount, from_user_id))
+                    cursor.execute("UPDATE users SET coins = coins + %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s", (amount, to_user_id))
+                    cursor.execute("""
+                        INSERT INTO transactions (from_user_id, to_user_id, amount, transaction_type)
+                        VALUES (%s, %s, %s, 'transfer')
+                    """, (from_user_id, to_user_id, amount))
+                    conn.commit()
+                    return True
+                except Exception as e:
+                    conn.rollback()
+                    raise e
         except Exception as e:
             logger.error(f"Error transferring coins: {e}")
-            if 'conn' in locals():
-                conn.rollback()
             return False
     
     def get_leaderboard(self, limit: int = 10) -> List[dict]:
@@ -296,6 +295,8 @@ class GameBot:
         self.word_list = self.load_word_list()
         self.game_jobs: Dict[int, List] = {}
         self.application = Application.builder().token(BOT_TOKEN).build()
+        self.game_lock = Lock()
+        self.challenge_lock = Lock()
         self.setup_handlers()
     
     async def start_bot(self):
@@ -306,11 +307,12 @@ class GameBot:
             with open(file_path, 'r', encoding='utf-8') as file:
                 words = {line.strip().lower() for line in file if line.strip()}
             if not words:
-                logger.warning("Word list is empty!")
+                logger.warning("Word list is empty! Using default minimal set.")
+                return {'apple', 'elephant', 'tiger'}
             return words
         except FileNotFoundError:
-            logger.error(f"Word list file not found: {file_path}")
-            return set()
+            logger.error(f"Word list file not found: {file_path}. Using default minimal set.")
+            return {'apple', 'elephant', 'tiger'}
         
     def is_valid_word(self, word: str) -> bool:
         return word.lower() in self.word_list
@@ -412,9 +414,10 @@ class GameBot:
         chat_id = update.effective_chat.id
         user = update.effective_user
         
-        if chat_id in self.active_games:
-            await update.message.reply_text("🎮 A game is already active!")
-            return
+        with self.game_lock:
+            if chat_id in self.active_games:
+                await update.message.reply_text("🎮 A game is already active!")
+                return
         
         self.db.create_or_update_user(user)
         user_data = self.db.get_user(user.id)
@@ -449,17 +452,18 @@ Choose mode:
         chat_id = update.effective_chat.id
         user = update.effective_user
         
-        if chat_id not in self.active_games:
-            await update.message.reply_text("❌ No active game!")
-            return
+        with self.game_lock:
+            if chat_id not in self.active_games:
+                await update.message.reply_text("❌ No active game!")
+                return
         
-        game = self.active_games[chat_id]
-        if game.state != GameState.WAITING:
-            await update.message.reply_text("❌ Game already started!")
-            return
-        if any(p.user_id == user.id for p in game.players):
-            await update.message.reply_text("You're already in!")
-            return
+            game = self.active_games[chat_id]
+            if game.state != GameState.WAITING:
+                await update.message.reply_text("❌ Game already started!")
+                return
+            if any(p.user_id == user.id for p in game.players):
+                await update.message.reply_text("You're already in!")
+                return
         
         self.db.create_or_update_user(user)
         user_data = self.db.get_user(user.id)
@@ -531,13 +535,14 @@ Use /join!
             await update.message.reply_text(f"❌ Need {stake} coins!")
             return
         
-        challenge_id = f"challenge_{chat_id}_{challenger.id}_{challenged_data['user_id']}_{int(datetime.now().timestamp())}"
+        challenge_id = f"challenge_{chat_id}_{challenger.id}_{challenged_data['user_id']}_{int(datetime.now(timezone.utc).timestamp())}"
         challenge = Challenge(
             challenge_id=challenge_id, challenger_id=challenger.id, challenged_id=challenged_data['user_id'],
             chat_id=chat_id, game_type="wordchain", stake=stake, state=ChallengeState.PENDING,
-            created_at=datetime.now(), expires_at=datetime.now() + timedelta(minutes=5)
+            created_at=datetime.now(timezone.utc), expires_at=datetime.now(timezone.utc) + timedelta(minutes=5)
         )
-        self.pending_challenges[challenge_id] = challenge
+        with self.challenge_lock:
+            self.pending_challenges[challenge_id] = challenge
         
         challenge_text = f"""
 ⚔️ **Challenge Issued!**
@@ -627,30 +632,32 @@ Questions? Ask in chat!
         job = context.job
         chat_id = job.data['chat_id']
         time_left = job.data['time_left']
-        if chat_id in self.active_games and self.active_games[chat_id].state == GameState.WAITING:
-            await context.bot.send_message(chat_id, f"{time_left}s left to /join.")
+        with self.game_lock:
+            if chat_id in self.active_games and self.active_games[chat_id].state == GameState.WAITING:
+                await context.bot.send_message(chat_id, f"{time_left}s left to /join.")
     
     async def auto_start_game(self, context: ContextTypes.DEFAULT_TYPE):
         job = context.job
         chat_id = job.data['chat_id']
         game = job.data['game']
         
-        if chat_id in self.active_games and game == self.active_games[chat_id] and game.state == GameState.WAITING:
-            if len(game.players) >= 2:
-                await context.bot.send_message(chat_id, "Game starting...")
-                turn_order = "\n".join([p.username for p in game.players])
-                await context.bot.send_message(chat_id, f"Turn order:\n{turn_order}")
-                for player in game.players:
-                    self.db.update_user_coins(player.user_id, -game.stake)
-                game.state = GameState.ACTIVE
-                game.current_player_index = 0
-                game.last_word_time = datetime.now()
-                random.shuffle(game.players)
-                await self.next_turn(None, game, context)
-            else:
-                await context.bot.send_message(chat_id, "❌ Not enough players. Cancelled.")
-                del self.active_games[chat_id]
-            self.cancel_game_jobs(chat_id, context)
+        with self.game_lock:
+            if chat_id in self.active_games and game == self.active_games[chat_id] and game.state == GameState.WAITING:
+                if len(game.players) >= 2:
+                    await context.bot.send_message(chat_id, "Game starting...")
+                    turn_order = "\n".join([p.username for p in game.players])
+                    await context.bot.send_message(chat_id, f"Turn order:\n{turn_order}")
+                    for player in game.players:
+                        self.db.update_user_coins(player.user_id, -game.stake)
+                    game.state = GameState.ACTIVE
+                    game.current_player_index = 0
+                    game.last_word_time = datetime.now(timezone.utc)
+                    random.shuffle(game.players)
+                    await self.next_turn(None, game, context)
+                else:
+                    await context.bot.send_message(chat_id, "❌ Not enough players. Cancelled.")
+                    del self.active_games[chat_id]
+                self.cancel_game_jobs(chat_id, context)
     
     def cancel_game_jobs(self, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         if chat_id in self.game_jobs:
@@ -670,14 +677,15 @@ Questions? Ask in chat!
         
         if data == "wordchain_default":
             await self.start_wordchain_game(query, chat_id, user, DEFAULT_GAME_COST)
-            if chat_id in self.active_games:
-                self.schedule_joining_jobs(self.active_games[chat_id], context)
+            with self.game_lock:
+                if chat_id in self.active_games:
+                    self.schedule_joining_jobs(self.active_games[chat_id], context)
         elif data == "wordchain_custom":
             await self.show_custom_game_options(query)
         elif data == "wordchain_rules":
             await self.show_game_rules(query)
         elif data.startswith("accept_challenge_"):
-            await self.accept_challenge(query, user, data.split("_", 2)[2])
+            await self.accept_challenge(query, user, data.split("_", 2)[2], context)
         elif data.startswith("decline_challenge_"):
             await self.decline_challenge(query, user, data.split("_", 2)[2])
         elif data == "join_game":
@@ -687,8 +695,9 @@ Questions? Ask in chat!
         elif data == "cancel_game":
             await self.cancel_game(query, user, chat_id, context)
         elif data == "cancel_stake_setting":
-            if chat_id in self.pending_stake_settings:
-                del self.pending_stake_settings[chat_id]
+            with self.game_lock:
+                if chat_id in self.pending_stake_settings:
+                    del self.pending_stake_settings[chat_id]
             await self.show_main_wordchain_menu(query, user)
         elif data == "back_to_main":
             await self.show_main_wordchain_menu(query, user)
@@ -720,40 +729,42 @@ Choose mode:
         await query.edit_message_text(game_info, reply_markup=reply_markup)
     
     async def cancel_game(self, query, user: User, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-        if chat_id not in self.active_games:
-            await query.answer("No active game!")
-            return
-        game = self.active_games[chat_id]
-        if user.id != game.creator_id:
-            await query.answer("Only creator can cancel!")
-            return
-        del self.active_games[chat_id]
-        self.cancel_game_jobs(chat_id, context)
+        with self.game_lock:
+            if chat_id not in self.active_games:
+                await query.answer("No active game!")
+                return
+            game = self.active_games[chat_id]
+            if user.id != game.creator_id:
+                await query.answer("Only creator can cancel!")
+                return
+            del self.active_games[chat_id]
+            self.cancel_game_jobs(chat_id, context)
         await query.edit_message_text("❌ Game cancelled by creator!")
     
     async def handle_start_wordchain(self, query, user: User, chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-        if chat_id not in self.active_games:
-            await query.answer("No active game!")
-            return
-        game = self.active_games[chat_id]
-        if user.id != game.creator_id:
-            await query.answer("Only creator can start!")
-            return
-        if len(game.players) < 2:
-            await query.answer("Need 2+ players!")
-            return
-        
-        for player in game.players:
-            player_data = self.db.get_user(player.user_id)
-            if player_data['coins'] < game.stake:
-                await query.answer(f"{player.username} lacks coins!")
+        with self.game_lock:
+            if chat_id not in self.active_games:
+                await query.answer("No active game!")
                 return
-            self.db.update_user_coins(player.user_id, -game.stake)
-        
-        game.state = GameState.ACTIVE
-        game.current_player_index = 0
-        game.last_word_time = datetime.now()
-        random.shuffle(game.players)
+            game = self.active_games[chat_id]
+            if user.id != game.creator_id:
+                await query.answer("Only creator can start!")
+                return
+            if len(game.players) < 2:
+                await query.answer("Need 2+ players!")
+                return
+            
+            for player in game.players:
+                player_data = self.db.get_user(player.user_id)
+                if player_data['coins'] < game.stake:
+                    await query.answer(f"{player.username} lacks coins!")
+                    return
+                self.db.update_user_coins(player.user_id, -game.stake)
+            
+            game.state = GameState.ACTIVE
+            game.current_player_index = 0
+            game.last_word_time = datetime.now(timezone.utc)
+            random.shuffle(game.players)
         
         await query.message.chat.send_message("Game starting...")
         turn_order = "\n".join([p.username for p in game.players])
@@ -767,18 +778,19 @@ Choose mode:
         if user_data['coins'] < stake:
             await query.edit_message_text(f"❌ Need {stake} coins!")
             return
-        if chat_id in self.active_games:
-            await query.edit_message_text("🎮 Game already active!")
-            return
-        
-        game_id = f"wc_{chat_id}_{int(datetime.now().timestamp())}"
-        game = WordChainGame(
-            chat_id=chat_id, game_id=game_id, state=GameState.WAITING,
-            players=[GamePlayer(creator.id, creator.username or creator.first_name, stake)],
-            current_player_index=0, words_used=[], current_word="", last_letter="",
-            stake=stake, creator_id=creator.id
-        )
-        self.active_games[chat_id] = game
+        with self.game_lock:
+            if chat_id in self.active_games:
+                await query.edit_message_text("🎮 Game already active!")
+                return
+            
+            game_id = f"wc_{chat_id}_{int(datetime.now(timezone.utc).timestamp())}"
+            game = WordChainGame(
+                chat_id=chat_id, game_id=game_id, state=GameState.WAITING,
+                players=[GamePlayer(creator.id, creator.username or creator.first_name, stake)],
+                current_player_index=0, words_used=[], current_word="", last_letter="",
+                stake=stake, creator_id=creator.id
+            )
+            self.active_games[chat_id] = game
         
         keyboard = [
             [InlineKeyboardButton("🎮 Join Game", callback_data="join_game")],
@@ -806,7 +818,8 @@ Use /join!
     async def show_custom_game_options(self, query):
         chat_id = query.message.chat_id
         user = query.from_user
-        self.pending_stake_settings[chat_id] = user.id
+        with self.game_lock:
+            self.pending_stake_settings[chat_id] = user.id
         keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_stake_setting")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.message.reply_text(
@@ -816,14 +829,15 @@ Use /join!
         await query.answer()
     
     async def start_wordchain_game_from_message(self, update, chat_id, creator, stake):
-        game_id = f"wc_{chat_id}_{int(datetime.now().timestamp())}"
+        game_id = f"wc_{chat_id}_{int(datetime.now(timezone.utc).timestamp())}"
         game = WordChainGame(
             chat_id=chat_id, game_id=game_id, state=GameState.WAITING,
             players=[GamePlayer(creator.id, creator.username or creator.first_name, stake)],
             current_player_index=0, words_used=[], current_word="", last_letter="",
             stake=stake, creator_id=creator.id
         )
-        self.active_games[chat_id] = game
+        with self.game_lock:
+            self.active_games[chat_id] = game
         players_text = "\n".join([f"• {p.username}" for p in game.players])
         game_text = f"""
 🎮 **Word Chain Game Lobby**
@@ -891,16 +905,17 @@ Good luck! 🍀
         await query.edit_message_text(rules_text, reply_markup=reply_markup)
     
     async def join_game(self, query, user: User, chat_id: int):
-        if chat_id not in self.active_games:
-            await query.answer("❌ No active game!")
-            return
-        game = self.active_games[chat_id]
-        if game.state != GameState.WAITING:
-            await query.answer("❌ Game started!")
-            return
-        if any(p.user_id == user.id for p in game.players):
-            await query.answer("Already joined!")
-            return
+        with self.game_lock:
+            if chat_id not in self.active_games:
+                await query.answer("❌ No active game!")
+                return
+            game = self.active_games[chat_id]
+            if game.state != GameState.WAITING:
+                await query.answer("❌ Game started!")
+                return
+            if any(p.user_id == user.id for p in game.players):
+                await query.answer("Already joined!")
+                return
         
         self.db.create_or_update_user(user)
         user_data = self.db.get_user(user.id)
@@ -941,32 +956,33 @@ Use /join!
         user = update.effective_user
         message = update.message.text.strip()
         
-        if chat_id in self.pending_stake_settings and self.pending_stake_settings[chat_id] == user.id:
-            try:
-                stake = int(message)
-                if stake <= 0 or stake > 1000:
-                    await update.message.reply_text("❌ Stake must be 1-1000 coins!")
-                    return
-                user_data = self.db.get_user(user.id)
-                if user_data['coins'] < stake:
-                    await update.message.reply_text(f"❌ Need {stake} coins!")
+        with self.game_lock:
+            if chat_id in self.pending_stake_settings and self.pending_stake_settings[chat_id] == user.id:
+                try:
+                    stake = int(message)
+                    if stake <= 0 or stake > 1000:
+                        await update.message.reply_text("❌ Stake must be 1-1000 coins!")
+                        return
+                    user_data = self.db.get_user(user.id)
+                    if user_data['coins'] < stake:
+                        await update.message.reply_text(f"❌ Need {stake} coins!")
+                        del self.pending_stake_settings[chat_id]
+                        return
+                    await self.start_wordchain_game_from_message(update, chat_id, user, stake)
+                    if chat_id in self.active_games:
+                        self.schedule_joining_jobs(self.active_games[chat_id], context)
                     del self.pending_stake_settings[chat_id]
-                    return
-                await self.start_wordchain_game_from_message(update, chat_id, user, stake)
-                if chat_id in self.active_games:
-                    self.schedule_joining_jobs(self.active_games[chat_id], context)
-                del self.pending_stake_settings[chat_id]
-            except ValueError:
-                await update.message.reply_text("❌ Enter a number (e.g., 14, 55)!")
-            return
+                except ValueError:
+                    await update.message.reply_text("❌ Enter a number (e.g., 14, 55)!")
+                return
         
-        if chat_id not in self.active_games or self.active_games[chat_id].state != GameState.ACTIVE:
-            return
+            if chat_id not in self.active_games or self.active_games[chat_id].state != GameState.ACTIVE:
+                return
         
-        game = self.active_games[chat_id]
-        current_player = game.players[game.current_player_index]
-        if current_player.user_id != user.id or not current_player.is_alive:
-            return
+            game = self.active_games[chat_id]
+            current_player = game.players[game.current_player_index]
+            if current_player.user_id != user.id or not current_player.is_alive:
+                return
         
         for job_name in [f"turn_reminder_{game.chat_id}_{current_player.user_id}", f"turn_timeout_{game.chat_id}_{current_player.user_id}"]:
             for job in context.job_queue.get_jobs_by_name(job_name):
@@ -994,7 +1010,7 @@ Use /join!
         game.words_used.append(message)
         game.current_word = message
         game.last_letter = message[-1]
-        game.last_word_time = datetime.now()
+        game.last_word_time = datetime.now(timezone.utc)
         await update.message.reply_text(f"✅ **{message.upper()}** - Good one, {current_player.username}!")
         await self.next_turn(update, game, context)
     
@@ -1070,19 +1086,21 @@ Start with: "{letter}"
         game = job.data['game']
         player = job.data['player']
         chat_id = job.data['chat_id']
-        if (chat_id in self.active_games and self.active_games[chat_id] == game and 
-            game.state == GameState.ACTIVE and game.players[game.current_player_index] == player):
-            mention = f"[{player.username}](tg://user?id={player.user_id})"
-            letter = game.last_letter.upper() if game.last_letter else "any letter"
-            await context.bot.send_message(chat_id, f"{mention}\n\n20s left! Start with '{letter}'", parse_mode='Markdown')
+        with self.game_lock:
+            if (chat_id in self.active_games and self.active_games[chat_id] == game and 
+                game.state == GameState.ACTIVE and game.players[game.current_player_index] == player):
+                mention = f"[{player.username}](tg://user?id={player.user_id})"
+                letter = game.last_letter.upper() if game.last_letter else "any letter"
+                await context.bot.send_message(chat_id, f"{mention}\n\n20s left! Start with '{letter}'", parse_mode='Markdown')
     
     async def turn_timeout_callback(self, context: ContextTypes.DEFAULT_TYPE):
         data = context.job.data
         game = data['game']
         player = data['player']
         chat_id = data['chat_id']
-        if chat_id in self.active_games and game.state == GameState.ACTIVE and player.is_alive:
-            await self.eliminate_player(context, game, player, "Time's up!")
+        with self.game_lock:
+            if chat_id in self.active_games and game.state == GameState.ACTIVE and player.is_alive:
+                await self.eliminate_player(context, game, player, "Time's up!")
     
     async def end_game(self, bot, game: WordChainGame, chat_id: int):
         game.state = GameState.FINISHED
@@ -1091,14 +1109,15 @@ Start with: "{letter}"
         
         if not winners:
             await bot.send_message(chat_id, "🎮 Game ended with no winners!")
-            if chat_id in self.active_games:
-                del self.active_games[chat_id]
+            with self.game_lock:
+                if chat_id in self.active_games:
+                    del self.active_games[chat_id]
             return
         
         total_pot = len(game.players) * game.stake
         reward_per_winner = total_pot // len(winners)
         
-        with self.get_connection() as conn:
+        with self.db.get_connection() as conn:
             cursor = conn.cursor()
             for winner in winners:
                 self.db.update_user_coins(winner.user_id, reward_per_winner)
@@ -1145,26 +1164,29 @@ Start with: "{letter}"
         
         end_text += f"\n\n🎯 **Words Used:** {', '.join(game.words_used)}"
         await bot.send_message(chat_id, end_text)
-        if chat_id in self.active_games:
-            del self.active_games[chat_id]
+        with self.game_lock:
+            if chat_id in self.active_games:
+                del self.active_games[chat_id]
     
-    async def accept_challenge(self, query, user: User, challenge_id: str):
-        if challenge_id not in self.pending_challenges:
-            await query.answer("❌ Challenge expired!")
-            return
-        challenge = self.pending_challenges[challenge_id]
-        if user.id != challenge.challenged_id:
-            await query.answer("❌ Only challenged can accept!")
-            return
+    async def accept_challenge(self, query, user: User, challenge_id: str, context: ContextTypes.DEFAULT_TYPE):
+        with self.challenge_lock:
+            if challenge_id not in self.pending_challenges:
+                await query.answer("❌ Challenge expired!")
+                return
+            challenge = self.pending_challenges[challenge_id]
+            if user.id != challenge.challenged_id:
+                await query.answer("❌ Only challenged can accept!")
+                return
         
         challenger_data = self.db.get_user(challenge.challenger_id)
         challenged_data = self.db.get_user(challenge.challenged_id)
         if challenger_data['coins'] < challenge.stake or challenged_data['coins'] < challenge.stake:
             await query.answer("❌ Insufficient coins!")
-            del self.pending_challenges[challenge_id]
+            with self.challenge_lock:
+                del self.pending_challenges[challenge_id]
             return
         
-        game_id = f"challenge_{challenge.chat_id}_{int(datetime.now().timestamp())}"
+        game_id = f"challenge_{challenge.chat_id}_{int(datetime.now(timezone.utc).timestamp())}"
         game = WordChainGame(
             chat_id=challenge.chat_id, game_id=game_id, state=GameState.ACTIVE,
             players=[
@@ -1174,11 +1196,13 @@ Start with: "{letter}"
             current_player_index=0, words_used=[], current_word="", last_letter="",
             stake=challenge.stake, creator_id=challenge.challenger_id
         )
-        self.active_games[challenge.chat_id] = game
+        with self.game_lock:
+            self.active_games[challenge.chat_id] = game
         
         self.db.update_user_coins(challenge.challenger_id, -challenge.stake)
         self.db.update_user_coins(challenge.challenged_id, -challenge.stake)
-        del self.pending_challenges[challenge_id]
+        with self.challenge_lock:
+            del self.pending_challenges[challenge_id]
         
         game_text = f"""
 ⚔️ **Challenge Accepted!**
@@ -1205,30 +1229,21 @@ Start with: "{letter}"
         )
     
     async def decline_challenge(self, query, user: User, challenge_id: str):
-        if challenge_id not in self.pending_challenges:
-            await query.answer("❌ Challenge expired!")
-            return
-        challenge = self.pending_challenges[challenge_id]
-        if user.id != challenge.challenged_id:
-            await query.answer("❌ Only challenged can decline!")
-            return
-        del self.pending_challenges[challenge_id]
+        with self.challenge_lock:
+            if challenge_id not in self.pending_challenges:
+                await query.answer("❌ Challenge expired!")
+                return
+            challenge = self.pending_challenges[challenge_id]
+            if user.id != challenge.challenged_id:
+                await query.answer("❌ Only challenged can decline!")
+                return
+            del self.pending_challenges[challenge_id]
         await query.edit_message_text(f"❌ {user.first_name} declined. Better luck next time!")
     
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Update {update} caused error {context.error}", exc_info=True)
         if update and update.effective_message:
             await update.effective_message.reply_text("😵 Oops! Something broke. Try again!")
-
-@app.route('/healthz', methods=['GET'])
-def health_check():
-    return "OK", 200
-
-@app.route('/webhook', methods=['POST'])
-async def webhook():
-    update = Update.de_json(request.get_json(), bot=bot.application.bot)
-    await bot.application.process_update(update)
-    return "OK", 200
 
 def main():
     global bot
@@ -1239,6 +1254,19 @@ def main():
         raise ValueError("BOT_TOKEN and WEBHOOK_URL environment variables must be set")
     
     asyncio.run(bot.application.bot.set_webhook(url=WEBHOOK_URL))
+    
+    from flask import Flask, request
+    app = Flask(__name__)
+    
+    @app.route('/healthz', methods=['GET'])
+    def health_check():
+        return "OK", 200
+    
+    @app.route('/webhook', methods=['POST'])
+    async def webhook():
+        update = Update.de_json(request.get_json(), bot.application.bot)
+        await bot.application.process_update(update)
+        return "OK", 200
     
     print("🎮 Game Bot starting as web service...")
     print("📝 Ensure:")
