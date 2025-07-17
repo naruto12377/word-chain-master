@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from enum import Enum
 from flask import Flask, request
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, User  # Added User import
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes
@@ -1101,7 +1101,7 @@ Start with: "{letter}"
         )
         context.job_queue.run_once(
             self.turn_timeout_callback, 60,
-            data={'game': game, 'player': player, 'chat_id': game.chat_id},
+            data={'game': game, 'player': current_player, 'chat_id': game.chat_id},
             name=f"turn_timeout_{game.chat_id}_{current_player.user_id}"
         )
     
