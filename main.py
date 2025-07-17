@@ -312,6 +312,7 @@ class GameBot:
         self.word_list = self.load_word_list()
         self.game_jobs: Dict[int, List] = {}
         self.application = Application.builder().token(BOT_TOKEN).build()
+        self.application.initialize()  # Added initialization
         self.setup_handlers()
     
     def load_word_list(self, file_path: str = 'words.txt') -> set:
