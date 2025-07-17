@@ -13,8 +13,9 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 from dataclasses import dataclass
 from enum import Enum
+from flask import Flask, request
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, User
+from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes
@@ -31,7 +32,10 @@ logger = logging.getLogger(__name__)
 # Constants
 DEFAULT_COINS = 100
 DEFAULT_GAME_COST = 10
-BOT_TOKEN = os.getenv('BOT_TOKEN')  # Set this in Render environment variables
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+WEBHOOK_URL = os.getenv('WEBHOOK_URL')  # Set this in Render environment variables (e.g., https://your-service.onrender.com/webhook)
+
+app = Flask(__name__)
 
 # Game States
 class GameState(Enum):
@@ -307,6 +311,8 @@ class GameBot:
         self.pending_stake_settings: Dict[int, int] = {}
         self.word_list = self.load_word_list()
         self.game_jobs: Dict[int, List] = {}
+        self.application = Application.builder().token(BOT_TOKEN).build()
+        self.setup_handlers()
     
     def load_word_list(self, file_path: str = 'words.txt') -> set:
         """Load word list for game validation"""
@@ -323,6 +329,20 @@ class GameBot:
     def is_valid_word(self, word: str) -> bool:
         """Check if a word is valid for the game"""
         return word.lower() in self.word_list
+    
+    def setup_handlers(self):
+        """Set up all command and message handlers"""
+        self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(CommandHandler("balance", self.balance_command))
+        self.application.add_handler(CommandHandler("pay", self.pay_command))
+        self.application.add_handler(CommandHandler("wordchain", self.wordchain_command))
+        self.application.add_handler(CommandHandler("join", self.join_command))
+        self.application.add_handler(CommandHandler("challenge", self.challenge_command))
+        self.application.add_handler(CommandHandler("leaderboard", self.leaderboard_command))
+        self.application.add_handler(CommandHandler("help", self.help_command))
+        self.application.add_handler(CallbackQueryHandler(self.handle_callback))
+        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_word_chain_message))
+        self.application.add_error_handler(self.error_handler)
     
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -545,7 +565,7 @@ Use /join!
 ⚔️ **Challenge Issued!**
 
 👤 **Challenger:** {challenger.first_name}
-🎯STL **Challenged:** @{challenged_username}
+🎯 **Challenged:** @{challenged_username}
 💰 **Stake:** {stake} coins
 🎮 **Game:** Word Chain
 
@@ -898,7 +918,7 @@ Last player standing wins!
 🏆 **Winning:**
 • Last standing
 • Collect coins
-• Collect points
+• Gain points
 
 Good luck! 🍀
         """
@@ -1081,7 +1101,7 @@ Start with: "{letter}"
         )
         context.job_queue.run_once(
             self.turn_timeout_callback, 60,
-            data={'game': game, 'player': current_player, 'chat_id': game.chat_id},
+            data={'game': game, 'player': player, 'chat_id': game.chat_id},
             name=f"turn_timeout_{game.chat_id}_{current_player.user_id}"
         )
     
@@ -1246,32 +1266,38 @@ Start with: "{letter}"
         if update and update.effective_message:
             await update.effective_message.reply_text("😵 Oops! Something broke. Try again!")
 
+# Flask routes
+@app.route('/healthz', methods=['GET'])
+def health_check():
+    """Health check endpoint for Render"""
+    return "OK", 200
+
+@app.route('/webhook', methods=['POST'])
+async def webhook():
+    """Handle Telegram webhook updates"""
+    update = Update.de_json(request.get_json(), bot=bot.application.bot)
+    await bot.application.process_update(update)
+    return "OK", 200
+
 def main():
-    """Run the bot"""
+    """Run the bot as a web service"""
+    global bot
     bot = GameBot()
-    application = Application.builder().token(BOT_TOKEN).build()
     
-    application.add_handler(CommandHandler("start", bot.start_command))
-    application.add_handler(CommandHandler("balance", bot.balance_command))
-    application.add_handler(CommandHandler("pay", bot.pay_command))
-    application.add_handler(CommandHandler("wordchain", bot.wordchain_command))
-    application.add_handler(CommandHandler("join", bot.join_command))
-    application.add_handler(CommandHandler("challenge", bot.challenge_command))
-    application.add_handler(CommandHandler("leaderboard", bot.leaderboard_command))
-    application.add_handler(CommandHandler("help", bot.help_command))
-    application.add_handler(CallbackQueryHandler(bot.handle_callback))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_word_chain_message))
-    application.add_error_handler(bot.error_handler)
+    if not BOT_TOKEN or not WEBHOOK_URL:
+        raise ValueError("BOT_TOKEN and WEBHOOK_URL environment variables must be set")
     
-    print("🎮 Game Bot starting...")
+    # Set webhook
+    asyncio.run(bot.application.bot.set_webhook(url=WEBHOOK_URL))
+    
+    print("🎮 Game Bot starting as web service...")
     print("📝 Ensure:")
     print("   1. BOT_TOKEN is set in environment")
     print("   2. DATABASE_URL is set in environment")
-    print("   3. 'words.txt' is present")
+    print("   3. WEBHOOK_URL is set in environment (e.g., https://your-service.onrender.com/webhook)")
+    print("   4. 'words.txt' is present")
     print("🚀 Launching...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 5000)))
 
 if __name__ == "__main__":
-    if not BOT_TOKEN:
-        raise ValueError("BOT_TOKEN environment variable not set")
     main()
