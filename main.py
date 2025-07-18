@@ -32,7 +32,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Get environment variables
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7656566332:AAEcDduoV6Of--ky_AsxImmZ4I4nYvp6qCw")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///game_bot.db")
 PORT = int(os.getenv("PORT", 8080))
 
