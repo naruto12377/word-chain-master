@@ -387,7 +387,7 @@ class GameBot:
             amount = int(context.args[1])
             if amount <= 0:
                 await update.message.reply_text("Amount must be positive!")
- Astronautics               return
+                return
             
             sender = update.effective_user
             sender_data = await self.db.get_user(sender.id)
@@ -425,7 +425,7 @@ class GameBot:
         await self.db.create_or_update_user(user)
         user_data = await self.db.get_user(user.id)
         if user_data['coins'] < DEFAULT_GAME_COST:
-            await update.message.reply_text(f"❌ Need {DEFAULT_GAME_COST} coins to start!")
+            await update.message.reply_text(f"❌ Need {DEFAULT_GAME_COST} coins!")
             return
         
         keyboard = [
@@ -501,7 +501,7 @@ Use /join!
                 keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_game")])
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 await context.bot.edit_message_text(
-                    chat_id=chat_id, messageसा_id=game.lobby_message_id,
+                    chat_id=chat_id, message_id=game.lobby_message_id,
                     text=game_text, reply_markup=reply_markup, parse_mode='Markdown'
                 )
             except Exception as e:
@@ -997,25 +997,26 @@ Use /join!
                 except JobLookupError:
                     logger.debug(f"Job {job.name} already removed")
         
-        if len(message) < 3:
+        word_lower = message.lower()
+        if len(word_lower) < 3:
             await self.eliminate_player(context, game, current_player, "Word < 3 letters!", update)
             return
-        if ' ' in message:
+        if ' ' in word_lower:
             await self.eliminate_player(context, game, current_player, "Single words only!", update)
             return
-        if not self.is_valid_word(message):
+        if not self.is_valid_word(word_lower):
             await self.eliminate_player(context, game, current_player, "Invalid word!", update)
             return
-        if message in game.words_used:
+        if word_lower in [w.lower() for w in game.words_used]:
             await self.eliminate_player(context, game, current_player, "Word used!", update)
             return
-        if game.last_letter and not message.startswith(game.last_letter):
+        if game.last_letter and not word_lower.startswith(game.last_letter):
             await self.eliminate_player(context, game, current_player, f"Must start with '{game.last_letter.upper()}'!", update)
             return
         
-        game.words_used.append(message)
-        game.current_word = message
-        game.last_letter = message[-1].lower()
+        game.words_used.append(word_lower)
+        game.current_word = word_lower
+        game.last_letter = word_lower[-1].lower()
         game.last_word_time = datetime.now(timezone.utc)
         game.current_player_index = (game.current_player_index + 1) % len(game.players)
         
@@ -1100,25 +1101,13 @@ Use /join!
                 
                 for player in alive_players:
                     await self.db.update_user_coins(player.user_id, coins_per_winner)
-                    async with self.db.get_connection() as conn:
-                        cursor = conn.cursor()
-                        cursor.execute("""
-                            UPDATE users SET games_won = games_won + 1, games_played = games_played + 1,
-                            total_coins_won = total_coins_won + %s
-                            WHERE user_id = %s
-                        """, (coins_per_winner, player.user_id))
-                        conn.commit()
+                    # Update stats
+                    await self.db.update_user_game_stats(player.user_id, True, coins_per_winner)
                 
                 for player in game.players:
                     if not player.is_alive:
-                        async with self.db.get_connection() as conn:
-                            cursor = conn.cursor()
-                            cursor.execute("""
-                                UPDATE users SET games_played = games_played + 1,
-                                total_coins_lost = total_coins_lost + %s
-                                WHERE user_id = %s
-                            """, (player.coins, player.user_id))
-                            conn.commit()
+                        # Update stats for losers
+                        await self.db.update_user_game_stats(player.user_id, False, player.coins)
                 
                 winner_names = ", ".join([p.username for p in alive_players])
                 await context.bot.send_message(
@@ -1128,6 +1117,29 @@ Use /join!
             
             del self.active_games[game.chat_id]
             self.cancel_game_jobs(game.chat_id, context)
+    
+    async def update_user_game_stats(self, user_id: int, is_winner: bool, coins: int):
+        try:
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                if is_winner:
+                    cursor.execute("""
+                        UPDATE users 
+                        SET games_won = games_won + 1, 
+                            games_played = games_played + 1,
+                            total_coins_won = total_coins_won + %s
+                        WHERE user_id = %s
+                    """, (coins, user_id))
+                else:
+                    cursor.execute("""
+                        UPDATE users 
+                        SET games_played = games_played + 1,
+                            total_coins_lost = total_coins_lost + %s
+                        WHERE user_id = %s
+                    """, (coins, user_id))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error updating user stats: {e}")
     
     async def accept_challenge(self, query, user: User, challenge_id: str, context: ContextTypes.DEFAULT_TYPE):
         async with self.challenge_lock:
@@ -1153,11 +1165,12 @@ Use /join!
             await query.message.chat.send_message(f"Challenge declined: @{user.username} lacks coins.")
             return
         
+        challenger_data = await self.db.get_user(challenge.challenger_id)
         game_id = f"wc_{challenge.chat_id}_{int(datetime.now(timezone.utc).timestamp())}"
         game = WordChainGame(
             chat_id=challenge.chat_id, game_id=game_id, state=GameState.ACTIVE,
             players=[
-                GamePlayer(challenge.challenger_id, (await self.db.get_user(challenge.challenger_id))['username'], challenge.stake),
+                GamePlayer(challenge.challenger_id, challenger_data['username'], challenge.stake),
                 GamePlayer(challenge.challenged_id, user.username or user.first_name, challenge.stake)
             ],
             current_player_index=0, words_used=[], current_word="", last_letter="",
@@ -1172,7 +1185,7 @@ Use /join!
         
         await query.message.chat.send_message(
             f"Challenge accepted! Starting Word Chain game between "
-            f"[{self.db.get_user(challenge.challenger_id)['username']}](tg://user?id={challenge.challenger_id}) "
+            f"[{challenger_data['username']}](tg://user?id={challenge.challenger_id}) "
             f"and [{user.username}](tg://user?id={user.id}) for {challenge.stake} coins each.",
             parse_mode='Markdown'
         )
